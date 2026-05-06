@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Virtual Try-On</title>
+  <style>
+    :root { --bg:#0b0b0c; --fg:#f5f5f7; --accent:#2563eb; --muted:#8a8a90; --danger:#fca5a5; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,sans-serif; overflow:hidden; }
+    .stage { position:relative; width:100vw; height:100vh; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    /* Selfie mirror */
+    #video, #overlay { transform: scaleX(-1); }
+    .topbar { position:absolute; top:0; left:0; right:0; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; z-index:5; background:linear-gradient(rgba(0,0,0,.55),rgba(0,0,0,0)); pointer-events:none; }
+    .pill { background:rgba(0,0,0,.55); padding:6px 12px; border-radius:999px; font-size:12px; pointer-events:auto; }
+    .status { font-size:11px; color:var(--muted); }
+    .controls { position:absolute; bottom:96px; left:0; right:0; padding:0 16px; display:grid; grid-template-columns:repeat(5,1fr); gap:6px; z-index:5; }
+    .controls button { padding:10px 4px; border:1px solid #2a2a2e; background:rgba(21,22,26,.85); color:var(--fg); border-radius:8px; font-size:13px; cursor:pointer; backdrop-filter:blur(6px); }
+    .controls button.active { background:var(--accent); border-color:var(--accent); }
+    .footer { position:absolute; bottom:0; left:0; right:0; padding:12px 16px 24px; display:flex; gap:8px; z-index:5; background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.5)); }
+    .footer button { flex:1; padding:14px; border-radius:10px; font-size:15px; font-weight:600; border:none; cursor:pointer; }
+    .add { background:var(--accent); color:white; }
+    .close { background:rgba(42,42,46,.95); color:white; }
+    .shot { background:rgba(42,42,46,.95); color:white; flex:0 0 auto; padding:14px 16px; }
+    .err { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(0,0,0,.85); color:var(--danger); text-align:center; z-index:10; font-size:14px; }
+    .hidden { display:none !important; }
+    .hint { position:absolute; bottom:170px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.55); padding:6px 12px; border-radius:999px; font-size:12px; z-index:5; pointer-events:none; }
+    .loader { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; z-index:8; background:rgba(11,11,12,.85); }
+    .spin { width:32px; height:32px; border:3px solid #2a2a2e; border-top-color:var(--accent); border-radius:50%; animation:spin 1s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div class="topbar">
+      <span class="pill" id="angleLabel">front</span>
+      <span class="pill status" id="status">initializing</span>
+    </div>
+
+    <div class="hint" id="hint">Look straight at camera</div>
+
+    <div class="controls">
+      <button data-angle="left_side">&#9664;&#9664;</button>
+      <button data-angle="left_45">&#9664;</button>
+      <button data-angle="front" class="active">&#9679;</button>
+      <button data-angle="right_45">&#9654;</button>
+      <button data-angle="right_side">&#9654;&#9654;</button>
+    </div>
+
+    <div class="footer">
+      <button class="close" id="btnClose">Close</button>
+      <button class="shot" id="btnShot" title="Capture">&#128247;</button>
+      <button class="add" id="btnAdd">Add to Cart</button>
+    </div>
+
+    <div class="loader" id="loader">
+      <div class="spin"></div>
+      <div id="loaderText">Loading try-on…</div>
+    </div>
+
+    <div class="err hidden" id="err"></div>
+  </div>
+
+<script type="module">
+import { FilesetResolver, FaceLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
+
+const params = new URLSearchParams(location.search);
+const productId = params.get('productId');
+// Only accept ?api= if it points at the same origin we were served from —
+// otherwise an attacker could trick a user into opening this page with
+// ?api=https://evil.example and exfiltrate the resulting fetch.
+let apiBase = location.origin + '/api';
+const apiOverride = params.get('api');
+if (apiOverride) {
+  try {
+    const u = new URL(apiOverride, location.origin);
+    if (u.origin === location.origin) apiBase = u.toString().replace(/\/$/, '');
+  } catch (_) { /* ignore — fall back to same-origin default */ }
+}
+// `manual` mode disables the camera/face tracking and shows the multi-angle PNG
+// switcher only — useful for screenshots, no-camera demos, and CI.
+const manualMode = params.get('mode') === 'manual';
+
+// Runtime calibration knobs:
+//   ?yawSign=-1     flip yaw sign if angles invert when you turn your head
+//   ?rowMajor=1     extract yaw assuming row-major matrix layout (fallback)
+const YAW_SIGN = params.get('yawSign') === '-1' ? -1 : 1;
+const ROW_MAJOR = params.get('rowMajor') === '1';
+
+const el = (id) => document.getElementById(id);
+const video = el('video');
+const overlay = el('overlay');
+const ctx = overlay.getContext('2d');
+
+let assets = null;
+let glassesImages = {};   // angle -> HTMLImageElement
+let currentAngle = 'front';
+let manualOverride = null;
+let manualOverrideUntil = 0;
+
+let faceLandmarker = null;
+let stream = null;
+let running = false;
+
+function showError(msg) {
+  const e = el('err');
+  e.textContent = msg;
+  e.classList.remove('hidden');
+}
+
+function postToHost(payload) {
+  const msg = JSON.stringify(payload);
+  if (window.FlutterChannel && window.FlutterChannel.postMessage) {
+    window.FlutterChannel.postMessage(msg);
+  }
+  if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+    window.ReactNativeWebView.postMessage(msg);
+  }
+}
+
+function setAngle(angle, fromUser) {
+  if (!assets || !assets.angles[angle]) return;
+  if (currentAngle !== angle) {
+    currentAngle = angle;
+    el('angleLabel').textContent = angle;
+    document.querySelectorAll('.controls button').forEach((b) => {
+      b.classList.toggle('active', b.dataset.angle === angle);
+    });
+  }
+  if (fromUser) {
+    manualOverride = angle;
+    manualOverrideUntil = performance.now() + 2500;
+  }
+}
+
+function preloadAssets() {
+  glassesImages = {};
+  for (const [angle, url] of Object.entries(assets.angles)) {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = url;
+    glassesImages[angle] = img;
+  }
+}
+
+async function loadAssets() {
+  if (!productId) {
+    showError('Missing productId');
+    return null;
+  }
+  el('loaderText').textContent = 'Loading product…';
+  const res = await fetch(apiBase + '/products/' + encodeURIComponent(productId) + '/assets');
+  if (!res.ok) throw new Error('Failed to load product (HTTP ' + res.status + ')');
+  return res.json();
+}
+
+async function initFaceLandmarker() {
+  el('loaderText').textContent = 'Loading face model…';
+  const fileset = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+  );
+  faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+      delegate: 'GPU',
+    },
+    runningMode: 'VIDEO',
+    numFaces: 1,
+    outputFaceBlendshapes: false,
+    outputFacialTransformationMatrixes: true,
+  });
+}
+
+async function startCamera() {
+  el('loaderText').textContent = 'Requesting camera…';
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise((resolve) => {
+    if (video.readyState >= 2) resolve();
+    else video.addEventListener('loadeddata', resolve, { once: true });
+  });
+  await video.play();
+}
+
+function resizeOverlay() {
+  // Match canvas backing store to displayed size for crisp drawing.
+  const rect = overlay.getBoundingClientRect();
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  overlay.width = Math.round(rect.width * dpr);
+  overlay.height = Math.round(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+// Map yaw (degrees) to angle key per spec §6.
+function yawToAngle(yawDeg) {
+  if (yawDeg > 35)  return 'right_side';
+  if (yawDeg > 15)  return 'right_45';
+  if (yawDeg < -35) return 'left_side';
+  if (yawDeg < -15) return 'left_45';
+  return 'front';
+}
+
+// Extract yaw (Y-axis rotation) in degrees from MediaPipe's 4x4 facial
+// transformation matrix. MediaPipe ships the data column-major by default,
+// but the convention is occasionally documented as row-major. If your
+// observed yaw appears swapped with pitch, append ?rowMajor=1 to the URL.
+function matrixYawDegrees(mat) {
+  // Column-major: m02 = mat[8], m22 = mat[10].
+  // Row-major:    m02 = mat[2], m22 = mat[10].
+  const r02 = ROW_MAJOR ? mat[2] : mat[8];
+  const r22 = mat[10];
+  const yaw = Math.atan2(r02, r22);
+  return yaw * (180 / Math.PI);
+}
+
+function drawGlasses(landmarks, displayW, displayH) {
+  const img = glassesImages[currentAngle];
+  if (!img || !img.complete || img.naturalWidth === 0) return;
+
+  // Eye outer corner landmarks (Face Mesh indices).
+  // 33 = right eye outer, 263 = left eye outer (subject's perspective).
+  const right = landmarks[33];
+  const left  = landmarks[263];
+  if (!right || !left) return;
+
+  // Convert normalised [0,1] to display pixels. Note: the camera is mirrored via
+  // CSS (transform: scaleX(-1)), and the canvas is mirrored too — so we draw
+  // using normalised coords as-is and the CSS flip handles mirroring.
+  const rx = right.x * displayW;
+  const ry = right.y * displayH;
+  const lx = left.x * displayW;
+  const ly = left.y * displayH;
+
+  const cx = (rx + lx) / 2;
+  const cy = (ry + ly) / 2;
+  const eyeDist = Math.hypot(lx - rx, ly - ry);
+
+  const cfg = (assets && assets.tryOnConfig) || {};
+  const scale = (typeof cfg.scale === 'number' ? cfg.scale : 1.1);
+  const offsetX = (typeof cfg.offsetX === 'number' ? cfg.offsetX : 0);
+  const offsetY = (typeof cfg.offsetY === 'number' ? cfg.offsetY : -0.02);
+
+  // Glasses width ≈ 2.4× inter-pupil distance × scale factor.
+  const targetWidth = eyeDist * 2.4 * scale;
+  const aspect = img.naturalHeight / img.naturalWidth;
+  const targetHeight = targetWidth * aspect;
+
+  // Roll: angle the eyes make with horizontal.
+  const roll = Math.atan2(ly - ry, lx - rx);
+
+  const drawX = cx + offsetX * eyeDist;
+  const drawY = cy + offsetY * eyeDist;
+
+  ctx.save();
+  ctx.translate(drawX, drawY);
+  ctx.rotate(roll);
+  ctx.drawImage(img, -targetWidth / 2, -targetHeight / 2, targetWidth, targetHeight);
+  ctx.restore();
+}
+
+let lastYawSmoothed = 0;
+function predictLoop() {
+  if (!running) return;
+  if (video.readyState < 2) {
+    requestAnimationFrame(predictLoop);
+    return;
+  }
+
+  const rect = overlay.getBoundingClientRect();
+  const w = rect.width, h = rect.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const now = performance.now();
+  let result = null;
+  try {
+    result = faceLandmarker.detectForVideo(video, now);
+  } catch (e) {
+    // Detection can throw transiently if the texture isn't ready; ignore and continue.
+  }
+
+  if (result && result.faceLandmarks && result.faceLandmarks.length > 0) {
+    el('hint').classList.add('hidden');
+    el('status').textContent = 'tracking';
+
+    // Yaw → angle mapping, but respect a manual override window for 2.5s after a tap.
+    if (now > manualOverrideUntil) {
+      manualOverride = null;
+      const mats = result.facialTransformationMatrixes;
+      if (mats && mats.length > 0) {
+        // The face landmarker exposes a 16-float matrix (column-major).
+        const m = mats[0].data;
+        let yawDeg = matrixYawDegrees(m);
+        // Mirror correction: video is CSS-flipped horizontally for selfie view,
+        // so flip the yaw. YAW_SIGN lets the user invert if calibration is off.
+        yawDeg = -yawDeg * YAW_SIGN;
+        lastYawSmoothed = lastYawSmoothed * 0.6 + yawDeg * 0.4;
+        const sensitivity = (assets.tryOnConfig && assets.tryOnConfig.rotationSensitivity) || 1.0;
+        setAngle(yawToAngle(lastYawSmoothed * sensitivity), false);
+      }
+    } else if (manualOverride) {
+      setAngle(manualOverride, false);
+    }
+
+    drawGlasses(result.faceLandmarks[0], w, h);
+  } else {
+    el('hint').classList.remove('hidden');
+    el('status').textContent = 'searching for face';
+  }
+
+  requestAnimationFrame(predictLoop);
+}
+
+function setupControls() {
+  document.querySelectorAll('.controls button').forEach((b) => {
+    b.addEventListener('click', () => setAngle(b.dataset.angle, true));
+  });
+  el('btnAdd').addEventListener('click', () => {
+    postToHost({ type: 'ADD_TO_CART', productId, angle: currentAngle });
+  });
+  el('btnClose').addEventListener('click', () => {
+    teardown();
+    postToHost({ type: 'CLOSE' });
+  });
+  el('btnShot').addEventListener('click', captureScreenshot);
+}
+
+function captureScreenshot() {
+  // Composite the mirrored video + overlay into an off-screen canvas, then post.
+  const w = video.videoWidth || overlay.width;
+  const h = video.videoHeight || overlay.height;
+  const off = document.createElement('canvas');
+  off.width = w;
+  off.height = h;
+  const c = off.getContext('2d');
+  c.save();
+  c.translate(w, 0);
+  c.scale(-1, 1);
+  c.drawImage(video, 0, 0, w, h);
+  // Overlay is at display size; scale-draw it.
+  c.drawImage(overlay, 0, 0, w, h);
+  c.restore();
+  const dataUrl = off.toDataURL('image/png');
+  postToHost({ type: 'SCREENSHOT', productId, angle: currentAngle, dataUrl });
+  // Visual feedback
+  el('btnShot').textContent = '✓';
+  setTimeout(() => { el('btnShot').textContent = '📷'; }, 800);
+}
+
+function teardown() {
+  running = false;
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+}
+
+window.addEventListener('resize', resizeOverlay);
+window.addEventListener('beforeunload', teardown);
+
+(async function main() {
+  setupControls();
+  try {
+    assets = await loadAssets();
+    if (!assets) return;
+    preloadAssets();
+    setAngle('front', false);
+  } catch (e) {
+    showError('Failed to load product: ' + e.message);
+    return;
+  }
+
+  if (manualMode) {
+    el('loader').classList.add('hidden');
+    el('status').textContent = 'manual (no camera)';
+    el('hint').classList.add('hidden');
+    // Show the front PNG static centred without camera/landmarker.
+    const stage = document.querySelector('.stage');
+    const fallback = document.createElement('img');
+    fallback.id = 'manualImg';
+    fallback.style.cssText = 'position:absolute; inset:0; margin:auto; max-width:90%; max-height:60vh; object-fit:contain;';
+    fallback.src = assets.angles[currentAngle];
+    stage.appendChild(fallback);
+    document.querySelectorAll('.controls button').forEach((b) => {
+      b.addEventListener('click', () => {
+        fallback.src = assets.angles[b.dataset.angle];
+      });
+    });
+    return;
+  }
+
+  try {
+    await initFaceLandmarker();
+    await startCamera();
+    resizeOverlay();
+    el('loader').classList.add('hidden');
+    running = true;
+    requestAnimationFrame(predictLoop);
+  } catch (e) {
+    el('loader').classList.add('hidden');
+    showError(
+      'Could not start try-on: ' + (e && e.message ? e.message : e) +
+      '\n\nTip: append &mode=manual to the URL to use the no-camera fallback.'
+    );
+  }
+})();
+</script>
+</body>
+</html>
